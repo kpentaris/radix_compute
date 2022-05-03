@@ -1,0 +1,68 @@
+#version 450
+#extension GL_EXT_debug_printf : enable
+
+#define GROUP_SIZE 16
+#define RADIX_BITS 4
+#define RADIX_ELEM_COUNT (1 << RADIX_BITS)
+#define RADIX_MASK (RADIX_ELEM_COUNT - 1)
+
+layout (local_size_x = GROUP_SIZE) in;
+
+layout(set = 0, binding = 0) /*readonly*/ buffer InputBuffer {
+    uint inputSrc[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer HistogramBuffer {
+    uint histogram[];
+};
+
+layout(push_constant) uniform constants {
+    uint inputLength;
+    uint sumArrLength;
+    uint startBit;
+    uint elementsPerWI;
+} consts;
+
+
+//shared uint groupHistogram[RADIX_ELEM_COUNT * gl_WorkGroupSize.x];
+shared uint groupHistogram[RADIX_ELEM_COUNT];
+
+void main() {
+    const uint radixElCount = RADIX_ELEM_COUNT;
+    const uint radixMask = RADIX_MASK;
+    const uint workGroups = gl_NumWorkGroups.x;
+    const uint workGroupSize = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+    const uint workGroupId = gl_WorkGroupID.x;
+    const uint threadIdx = gl_LocalInvocationIndex;
+    const uint globalIdx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.x * gl_GlobalInvocationID.y;
+
+    uint threadInputBoundary = uint(ceil((consts.inputLength / consts.elementsPerWI) / workGroupSize));
+
+    if (threadIdx < radixElCount) { // array init
+        groupHistogram[threadIdx] = 0;
+    }
+    barrier();
+    memoryBarrierShared();
+
+    uint threadInputOffset = globalIdx * consts.elementsPerWI;// maybe the elementsPerWI should be also broken down into blocks if they are too big
+    for (int i = 0; i < consts.elementsPerWI; i++) {
+        uint binIdx = (inputSrc[threadInputOffset + i] >> consts.startBit) & radixMask;
+        if(threadInputOffset + i < consts.inputLength) {
+            atomicAdd(groupHistogram[binIdx], 1);
+        }
+    }
+
+    barrier();
+    memoryBarrierShared();
+
+    if (threadIdx < radixElCount) {
+        // the threadIdx here is used as a binIdx
+        //        uint sumBin = 0;
+        //        for(int i = 0; i < threadInputBoundary; i++) {
+        //            sumBin += groupHistogram[i * radixElCount + threadIdx];
+        //        }
+        //
+        //        histogram[threadIdx * workGroups + workGroupId] = sumBin;
+        histogram[threadIdx * workGroups + workGroupId] = groupHistogram[threadIdx];
+    }
+}

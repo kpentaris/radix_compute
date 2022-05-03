@@ -1,0 +1,136 @@
+#version 450
+#extension GL_EXT_debug_printf : enable
+
+#define GROUP_SIZE 16
+#define RADIX_BITS 4
+#define RADIX_ELEM_COUNT (1 << RADIX_BITS)
+#define RADIX_MASK (RADIX_ELEM_COUNT - 1)
+#define SCAN_N_PER_WI 16
+#define N_PER_WI 64
+
+layout (local_size_x = GROUP_SIZE) in;
+
+layout(set = 0, binding = 0) buffer InputBuffer {
+    uint buckets[];// len=workgroups x RADIX_ELEM_COUNT
+};
+
+layout(set = 0, binding = 1) coherent buffer GlobalPrefixSumBuffer {
+    uint globalPrefixSums[];// should be renamed to globalPrefixSumTotals
+};
+
+layout(push_constant) uniform constants {
+    uint inputLength;// unused
+    uint sumArrLength;
+    uint startBit;// unused
+    uint elementsPerWI;// unused
+} consts;
+
+// we need buffer on the right of the array as well to avoid bounds checks inside psum function
+shared uint groupPrefixSums[3 * GROUP_SIZE];
+const uint groupPSumsOffset = GROUP_SIZE;
+
+shared uint previousGroupPSum;
+
+uint prefixSum(in out uint data[N_PER_WI]) {
+    const uint globalIdx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.x * gl_GlobalInvocationID.y;
+    uint sum = 0;
+    uint temp;
+    for (uint i = 0; i < N_PER_WI; i++) {
+        temp = data[i];
+        data[i] = sum;
+        sum += temp;
+    }
+    return sum;
+}
+
+/**
+ * Speedup tactic: We do not do the prefix sum for each
+ * entry but for every odd entry and then for each even
+ * entry we add its immediate previous entry
+ */
+uvec2 groupPrefixSum() {
+    const uint threadIdx = gl_LocalInvocationIndex;
+    const uint offset = GROUP_SIZE;
+    const uint idx = 2 * threadIdx + offset + 1;// we choose every odd thread
+
+    for (uint i = 1; i < offset; i*=2) {
+        groupPrefixSums[idx] += groupPrefixSums[idx - i];
+        barrier();
+        memoryBarrierShared();
+    }
+    groupPrefixSums[idx - 1] += groupPrefixSums[idx - 2];
+    barrier();
+    memoryBarrierShared();
+
+    uint groupSum = groupPrefixSums[2 * GROUP_SIZE - 1];// get the last element on the array
+    uint addValue = groupPrefixSums[offset + threadIdx - 1];// we subtract 1 because we want the exclusive scan
+    return uvec2(addValue, groupSum);
+}
+
+void main() {
+    const uint workGroups = gl_NumWorkGroups.x;
+    const uint workGroupId = gl_WorkGroupID.x;
+    const uint threadIdx = gl_LocalInvocationIndex;
+    const uint globalIdx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.x * gl_GlobalInvocationID.y;
+    const uint nPerWI = N_PER_WI;
+    const uint bucketsLen = consts.sumArrLength * RADIX_ELEM_COUNT; // sumArrLen = workGroups in other steps
+
+    uint offset = nPerWI * threadIdx;
+    uint data[N_PER_WI];
+
+    // execute parallel prefix sum for globalPrefixSums array
+    // We can have up to 65535 groups, which is also the number of the max size of the globalPrefixSums array.
+    // Since the local size is 1024, if each thread of workgroup 0 handles 64 elements of the globalPrefixSums array,
+    // we can execute a full parallel prefix sum on it just within one group, without having to involve any other globally shared arrays.
+
+    for (uint i = 0; i < nPerWI; i++) {
+        if (offset + i < consts.sumArrLength) {
+            data[i] = globalPrefixSums[offset + i];
+        }
+        else {
+            data[i] = 0;
+        }
+    }
+    uint globalSum = prefixSum(data);
+    groupPrefixSums[threadIdx] = 0;
+    groupPrefixSums[threadIdx + groupPSumsOffset] = globalSum;
+    barrier();
+    memoryBarrierShared();
+
+    uvec2 tuple = groupPrefixSum();
+    uint addToGlobalData = tuple.x;
+    for (uint i = 0; i < nPerWI; i++) {
+        if (offset + i < consts.sumArrLength) {
+            data[i] += addToGlobalData;
+            globalPrefixSums[offset + i] = data[i]; // TODO move this to shared mem
+        }
+    }
+
+    barrier();
+    groupMemoryBarrier();
+
+    const uint step = SCAN_N_PER_WI * GROUP_SIZE; // radix_scan.comp nPerWI = 16
+    const uint bounds = uint(ceil(float(bucketsLen) / float(step)));
+    const uint blocksPerThread = uint(ceil(float(bounds) / float(GROUP_SIZE)));
+    if(threadIdx * blocksPerThread < bounds) {
+        for (uint i = 0; i < blocksPerThread; i++) {
+            const uint localOffset = step * i + threadIdx * bounds * step;
+            uint sum = globalPrefixSums[threadIdx * i];
+            for (uint j = 0; j < step; j++) {
+                if(localOffset + j < bucketsLen) {
+                    uint prev = buckets[localOffset + j];
+                    buckets[localOffset + j] += sum;
+                    //                debugPrintfEXT("buckets[%d]=%d + gpsum[%d]=%d = %d\n", localOffset + i, prev, threadIdx, globalPrefixSums[threadIdx], buckets[localOffset + i]);
+                }
+            }
+        }
+    }
+
+//    barrier();
+//    if(globalIdx == 0) {
+//        for (uint i = 0; i < bucketsLen; i+=50) {
+//            debugPrintfEXT("buckets[%d]=%d\n", i, buckets[i]);
+//        }
+//    }
+
+}

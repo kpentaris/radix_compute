@@ -1,0 +1,220 @@
+#version 450
+#extension GL_EXT_debug_printf : enable
+
+// Replace all with const uints
+#define GROUP_SIZE 16
+#define RADIX_BITS 4
+#define RADIX_ELEM_CNT (1 << RADIX_BITS)
+#define RADIX_MASK (RADIX_ELEM_CNT - 1)
+#define SORT_RADIX_BITS 2
+#define SORT_RADIX_ELEM_CNT (1 << SORT_RADIX_BITS)
+#define SORT_RADIX_MASK (SORT_RADIX_ELEM_CNT - 1)
+
+// all values for BLOCK_SIZE must be powers of 2
+#define BLOCK_SIZE 2 * GROUP_SIZE / SORT_RADIX_ELEM_CNT
+//#define BLOCK_SIZE 32
+
+layout (local_size_x = GROUP_SIZE) in;
+
+layout(set = 0, binding = 0) buffer InputBuffer {
+    uint inputSrc[];
+};
+
+layout(set = 0, binding = 1) buffer OutputBuffer {
+    uint outputDst[];
+};
+
+layout(set = 0, binding = 2) buffer PSumBuffer {
+    uint globalPSum[];
+};
+
+layout(set = 0, binding = 3) buffer GlobalSumBuffer {
+    uint globalSums[];
+};
+
+layout(push_constant) uniform constants {
+    uint inputLength;
+    uint sumArrLength;
+    uint startBit;
+    uint elementsPerWI;
+} consts;
+
+// We have 2 x GROUP_SIZE buckets because for the parallel prefix sum we can
+// handle an array that is as big as twice the group size. This is because each
+// thread starts at every odd index and at the end it handles its previous even idx.
+// Additionally, we have to double the array size yet again in order to have enough
+// 0 padding on the left for the starting indices to 'prefix sum' with 0s.
+shared uint blockSortBuckets[3 * SORT_RADIX_ELEM_CNT * BLOCK_SIZE]; // 3x because we also have threads that go over the length and we don't want to if() them out
+shared uint sortedBlock[BLOCK_SIZE];
+shared uint localBlockPSum[RADIX_ELEM_CNT];
+shared uint carryOver[RADIX_ELEM_CNT];
+shared uint perBlockCarryOver[RADIX_ELEM_CNT];
+
+uint prefixSum(uint iblock) {
+    const uint threadIdx = gl_LocalInvocationIndex;
+    uint offset = SORT_RADIX_ELEM_CNT * BLOCK_SIZE;
+    uint blockIdx = 2 * threadIdx + offset + 1;// we choose every odd thread
+
+    for (uint i = 1; i < offset; i*=2) {
+        blockSortBuckets[blockIdx] += blockSortBuckets[blockIdx - i];
+        barrier();
+        memoryBarrierShared();
+    }
+    blockSortBuckets[blockIdx - 1] += blockSortBuckets[blockIdx - 2];
+    barrier();
+    memoryBarrierShared();
+
+    uint groupSum = blockSortBuckets[2 * SORT_RADIX_ELEM_CNT * BLOCK_SIZE - 1];// get the last element on the array
+    return groupSum;
+}
+
+uint prefixSumLocalBlock() {
+    // TODO parallelize this
+    uint sum = 0;
+    for (uint i = 0; i < RADIX_ELEM_CNT; i++) {
+        uint temp = localBlockPSum[i];
+        localBlockPSum[i] = sum;
+        sum += temp;
+    }
+    return sum;
+}
+
+void resetBucketsBuffer(uint threadIdx) {
+        uint threadInitStep = 2 * SORT_RADIX_ELEM_CNT * BLOCK_SIZE / GROUP_SIZE;
+//    uint threadInitStep = 256 / GROUP_SIZE;//2 * GROUP_SIZE / BLOCK_SIZE;
+    for (uint i = 0; i < threadInitStep; i++) {
+        blockSortBuckets[threadInitStep * threadIdx + i] = 0;
+    }
+    if (threadIdx < RADIX_ELEM_CNT) {
+        perBlockCarryOver[threadIdx] = 0;
+    }
+    barrier();
+    groupMemoryBarrier();
+    memoryBarrierShared();
+}
+
+void main() {
+    const uint blockSortBucketsEffectiveLen = 2 * SORT_RADIX_ELEM_CNT * BLOCK_SIZE; // THE USED LENGTH, NOT THE ARRAY LENGTH 3 * ...
+    const uint sortedBlockLen = BLOCK_SIZE;
+
+    uint threadIdx = gl_LocalInvocationIndex;
+    uint workGroups = gl_NumWorkGroups.x;
+    uint workGroupId = gl_WorkGroupID.x;
+    uint globalIdx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.x * gl_GlobalInvocationID.y;
+    uint blocksPerWG = uint(ceil(float(consts.inputLength) / float(BLOCK_SIZE * workGroups)));
+    uint radixMask = RADIX_MASK;
+    uint sortRadixMask = SORT_RADIX_MASK;
+    uint baseOffset = SORT_RADIX_ELEM_CNT * BLOCK_SIZE;
+    uint groupOffset = workGroupId * BLOCK_SIZE * blocksPerWG;
+
+    if (threadIdx < RADIX_ELEM_CNT) {
+        carryOver[threadIdx] = globalPSum[threadIdx * workGroups + workGroupId];
+        localBlockPSum[threadIdx] = 0;
+    }
+    resetBucketsBuffer(threadIdx);
+    barrier();
+    groupMemoryBarrier();
+    memoryBarrierShared();
+
+// AFTER THE FIRST RADIX FULL ROUND, SOME OF THE INPUTSRC BECOME 0!
+// IT MEANS SOME OF THE OUTPUTDST ARE 0 AND THEN CMDBUFFERCOPY'D TO INPUTSRC
+// OR THAT WE GOT VALUES THAT CONFLICT IN IDX
+//    if(threadIdx == 0) {
+//        debugPrintfEXT("INPUT SRC 2049 %d\n", inputSrc[2049]);
+//    }
+
+    uint offsetAddr = 0;
+    for (uint iblock = 0; iblock < blocksPerWG; iblock++, offsetAddr += BLOCK_SIZE) {
+//        if(workGroupId == 0 && threadIdx == 0) {
+//            for (uint i = 0; i < 16; i++) {
+//                debugPrintfEXT("CARRYOVER[%d]=%d\n", i, carryOver[i]);
+//            }
+//        }
+//        barrier();
+
+
+        if (threadIdx < sortedBlockLen) {
+            sortedBlock[threadIdx] = 0;// initialization
+        }
+
+        barrier();
+        groupMemoryBarrier();
+
+        uint inputIdx = groupOffset + offsetAddr + threadIdx;
+        uint inputVal = inputSrc[inputIdx];// TODO Add bounds check for final BLOCK and WG
+
+//        if(workGroupId == 32 && iblock == 0) {
+//            debugPrintfEXT("INPUTVAL %d RADIX %d\n", inputVal, (inputVal >> consts.startBit) & radixMask);
+//        }
+
+        for (uint i = 0; i < RADIX_BITS; i+=SORT_RADIX_BITS) {
+            uint binIdx = (inputVal >> (consts.startBit + i)) & sortRadixMask;
+            const uint blockIdx = baseOffset + binIdx * BLOCK_SIZE + threadIdx;
+            if (threadIdx < BLOCK_SIZE && inputIdx < consts.inputLength && blockIdx < blockSortBucketsEffectiveLen) {
+                blockSortBuckets[blockIdx] += 1;
+            }
+
+            barrier();
+            groupMemoryBarrier();
+            memoryBarrierShared();
+            uint groupPSum = prefixSum(iblock);
+            barrier();
+            groupMemoryBarrier();
+            memoryBarrierShared();
+
+            uint idx = baseOffset + binIdx * BLOCK_SIZE + threadIdx - 1;
+            if (threadIdx < BLOCK_SIZE && inputIdx < consts.inputLength) {
+                sortedBlock[blockSortBuckets[idx]] = inputVal;
+            }
+
+            barrier();
+            groupMemoryBarrier();
+            memoryBarrierShared();
+            resetBucketsBuffer(threadIdx);
+            barrier();
+            groupMemoryBarrier();
+            memoryBarrierShared();
+            inputVal = sortedBlock[threadIdx];
+        }
+
+        uint radix = (inputVal >> consts.startBit) & radixMask;
+        if (threadIdx < BLOCK_SIZE && inputIdx < consts.inputLength) {
+            atomicAdd(localBlockPSum[radix], 1);
+        }
+        barrier();
+        memoryBarrierShared();
+        if (threadIdx == 0) {
+            prefixSumLocalBlock();
+        }
+        barrier();
+        memoryBarrierShared();
+
+        if (threadIdx < BLOCK_SIZE && inputIdx < consts.inputLength) {
+            uint outIdx = carryOver[radix] + threadIdx - localBlockPSum[radix];
+
+//            if(iblock == 0 && (radix == 6 || radix == 7 || radix == 9 || radix == 10)) {
+//                debugPrintfEXT("WG-%d BLOCK-%d CARRYOVER[%d] %d, TIDX %d LBPS %d\n", workGroupId, iblock, radix, carryOver[radix], threadIdx,
+//                localBlockPSum[radix]);
+////                debugPrintfEXT("WG-%d TIDX-%d OUTIDX %d GROUPOFFSET %d OFFSETADDR %d\n", workGroupId, threadIdx, outIdx, groupOffset, offsetAddr);
+//            }
+
+//            if(outputDst[outIdx] != 0) {
+//                debugPrintfEXT("WG-%d TIDX-%d OUTIDX %d GROUPOFFSET %d OFFSETADDR %d\n", workGroupId, threadIdx, outIdx, groupOffset, offsetAddr);
+//            }
+
+            outputDst[outIdx] = inputVal;
+            atomicAdd(perBlockCarryOver[radix], 1);
+        }
+        barrier();
+        groupMemoryBarrier();
+        memoryBarrierShared();
+        if (threadIdx < RADIX_ELEM_CNT) {
+            carryOver[threadIdx] += perBlockCarryOver[threadIdx];
+            perBlockCarryOver[threadIdx] = 0;
+            localBlockPSum[threadIdx] = 0;
+        }
+        barrier();
+        groupMemoryBarrier();
+        memoryBarrierShared();
+    }
+}
