@@ -73,7 +73,7 @@ void main() {
     const uint threadIdx = gl_LocalInvocationIndex;
     const uint globalIdx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.x * gl_GlobalInvocationID.y;
     const uint nPerWI = N_PER_WI;
-    const uint bucketsLen = consts.sumArrLength * RADIX_ELEM_COUNT; // sumArrLen = workGroups in other steps
+    const uint bucketsLen = consts.sumArrLength * RADIX_ELEM_COUNT;// sumArrLen = workGroups in other steps
 
     uint offset = nPerWI * threadIdx;
     uint data[N_PER_WI];
@@ -102,35 +102,27 @@ void main() {
     for (uint i = 0; i < nPerWI; i++) {
         if (offset + i < consts.sumArrLength) {
             data[i] += addToGlobalData;
-            globalPrefixSums[offset + i] = data[i]; // TODO move this to shared mem
+            globalPrefixSums[offset + i] = data[i];
         }
     }
 
     barrier();
     groupMemoryBarrier();
 
-    const uint step = SCAN_N_PER_WI * GROUP_SIZE; // radix_scan.comp nPerWI = 16
+    const uint step = SCAN_N_PER_WI * GROUP_SIZE;// radix_scan.comp nPerWI = 16
     const uint bounds = uint(ceil(float(bucketsLen) / float(step)));
     const uint blocksPerThread = uint(ceil(float(bounds) / float(GROUP_SIZE)));
-    if(threadIdx * blocksPerThread < bounds) {
+    if (threadIdx * blocksPerThread < bounds) {
         for (uint i = 0; i < blocksPerThread; i++) {
             const uint localOffset = step * i + threadIdx * bounds * step;
             uint sum = globalPrefixSums[threadIdx * i];
             for (uint j = 0; j < step; j++) {
-                if(localOffset + j < bucketsLen) {
+                if (localOffset + j < bucketsLen) {
                     uint prev = buckets[localOffset + j];
                     buckets[localOffset + j] += sum;
-                    //                debugPrintfEXT("buckets[%d]=%d + gpsum[%d]=%d = %d\n", localOffset + i, prev, threadIdx, globalPrefixSums[threadIdx], buckets[localOffset + i]);
                 }
             }
         }
     }
-
-//    barrier();
-//    if(globalIdx == 0) {
-//        for (uint i = 0; i < bucketsLen; i+=50) {
-//            debugPrintfEXT("buckets[%d]=%d\n", i, buckets[i]);
-//        }
-//    }
 
 }

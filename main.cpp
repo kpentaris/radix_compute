@@ -21,7 +21,7 @@ static unsigned long z = 362436069, w = 521288629;
 #define BAIL_ON_BAD_RESULT(result) \
   if (VK_SUCCESS != (result)) { fprintf(stderr, "Failure at %u %s\n", __LINE__, __FILE__); exit(result); }
 
-#define INPUT_LENGTH 100000000
+#define INPUT_LENGTH 10000000
 #define MAX_WG_NUMBER 65535
 
 // Remember when changing this to also change it in the shader.

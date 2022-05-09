@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(GPURadix)
+project(RadixCompute)
 
 set(CMAKE_CXX_STANDARD 20)
 
@@ -16,5 +16,5 @@ link_directories(
 
 link_libraries(vulkan-1.lib)
 
-add_executable(GPURadix main.cpp)
-#add_executable(GPURadix cpu_radix.cpp)
+add_executable(RadixCompute main.cpp)
+#add_executable(RadixCompute cpu_radix.cpp)
